@@ -6,7 +6,8 @@ import datetime
 import secrets
 import uuid
 import weakref
-from contextlib import AsyncExitStack, asynccontextmanager
+from collections.abc import Coroutine
+from contextlib import AsyncExitStack, asynccontextmanager, suppress
 from dataclasses import dataclass, field
 from pathlib import Path
 from typing import Any, Generic, Literal, TypeVar, cast, overload
@@ -94,6 +95,7 @@ __all__ = [
 logger = get_logger(__name__)
 
 T = TypeVar("T", bound="ClientTransport")
+ResultT = TypeVar("ResultT")
 
 
 @dataclass
@@ -655,6 +657,69 @@ class Client(Generic[ClientTransportT]):
             # Ensure ready event is set even if context manager entry fails
             self._session_state.ready_event.set()
 
+    async def _await_with_session_monitoring(
+        self, coro: Coroutine[Any, Any, ResultT]
+    ) -> ResultT:
+        """Await a coroutine while monitoring the session task for errors.
+
+        When using HTTP transports, server errors (4xx/5xx) are raised in the
+        background session task, not in the coroutine waiting for a response.
+        This causes the client to hang indefinitely since the response never
+        arrives. This method monitors the session task and propagates any
+        exceptions that occur, preventing the client from hanging.
+
+        Args:
+            coro: The coroutine to await (typically a session method call)
+
+        Returns:
+            The result of the coroutine
+
+        Raises:
+            The exception from the session task if it fails, or RuntimeError
+            if the session task completes unexpectedly without an exception.
+        """
+        session_task = self._session_state.session_task
+
+        # If no session task, just await directly
+        if session_task is None:
+            return await coro
+
+        # If session task already failed, raise immediately
+        if session_task.done():
+            exc = session_task.exception()
+            if exc:
+                raise exc
+            raise RuntimeError("Session task completed unexpectedly")
+
+        # Create task for our call
+        call_task = asyncio.create_task(coro)
+
+        try:
+            done, _ = await asyncio.wait(
+                {call_task, session_task},
+                return_when=asyncio.FIRST_COMPLETED,
+            )
+
+            if session_task in done:
+                # Session task completed (likely errored) before our call finished
+                call_task.cancel()
+                with anyio.CancelScope(shield=True), suppress(asyncio.CancelledError):
+                    await call_task
+
+                # Raise the session task exception
+                exc = session_task.exception()
+                if exc:
+                    raise exc
+                raise RuntimeError("Session task completed unexpectedly")
+
+            # Our call completed first - get the result
+            return call_task.result()
+        except asyncio.CancelledError:
+            call_task.cancel()
+            with anyio.CancelScope(shield=True), suppress(asyncio.CancelledError):
+                await call_task
+            raise
+
     def _handle_task_status_notification(
         self, notification: TaskStatusNotification
     ) -> None:
@@ -685,7 +750,7 @@ class Client(Generic[ClientTransportT]):
 
     async def ping(self) -> bool:
         """Send a ping request."""
-        result = await self.session.send_ping()
+        result = await self._await_with_session_monitoring(self.session.send_ping())
         return isinstance(result, mcp.types.EmptyResult)
 
     async def cancel(
@@ -719,7 +784,7 @@ class Client(Generic[ClientTransportT]):
 
     async def set_logging_level(self, level: mcp.types.LoggingLevel) -> None:
         """Send a logging/setLevel request."""
-        await self.session.set_logging_level(level)
+        await self._await_with_session_monitoring(self.session.set_logging_level(level))
 
     async def send_roots_list_changed(self) -> None:
         """Send a roots/list_changed notification."""
@@ -739,7 +804,9 @@ class Client(Generic[ClientTransportT]):
         """
         logger.debug(f"[{self.name}] called list_resources")
 
-        result = await self.session.list_resources()
+        result = await self._await_with_session_monitoring(
+            self.session.list_resources()
+        )
         return result
 
     async def list_resources(self) -> list[mcp.types.Resource]:
@@ -768,7 +835,9 @@ class Client(Generic[ClientTransportT]):
         """
         logger.debug(f"[{self.name}] called list_resource_templates")
 
-        result = await self.session.list_resource_templates()
+        result = await self._await_with_session_monitoring(
+            self.session.list_resource_templates()
+        )
         return result
 
     async def list_resource_templates(
@@ -817,12 +886,16 @@ class Client(Generic[ClientTransportT]):
                     else None,  # SEP-1686: task as direct param (spec-compliant)
                 )
             )
-            result = await self.session.send_request(
-                request=request,  # type: ignore[arg-type]
-                result_type=mcp.types.ReadResourceResult,
+            result = await self._await_with_session_monitoring(
+                self.session.send_request(
+                    request=request,  # type: ignore[arg-type]
+                    result_type=mcp.types.ReadResourceResult,
+                )
             )
         else:
-            result = await self.session.read_resource(uri)
+            result = await self._await_with_session_monitoring(
+                self.session.read_resource(uri)
+            )
         return result
 
     @overload
@@ -964,7 +1037,7 @@ class Client(Generic[ClientTransportT]):
         """
         logger.debug(f"[{self.name}] called list_prompts")
 
-        result = await self.session.list_prompts()
+        result = await self._await_with_session_monitoring(self.session.list_prompts())
         return result
 
     async def list_prompts(self) -> list[mcp.types.Prompt]:
@@ -1027,13 +1100,15 @@ class Client(Generic[ClientTransportT]):
                     else None,  # SEP-1686: task as direct param (spec-compliant)
                 )
             )
-            result = await self.session.send_request(
-                request=request,  # type: ignore[arg-type]
-                result_type=mcp.types.GetPromptResult,
+            result = await self._await_with_session_monitoring(
+                self.session.send_request(
+                    request=request,  # type: ignore[arg-type]
+                    result_type=mcp.types.GetPromptResult,
+                )
             )
         else:
-            result = await self.session.get_prompt(
-                name=name, arguments=serialized_arguments
+            result = await self._await_with_session_monitoring(
+                self.session.get_prompt(name=name, arguments=serialized_arguments)
             )
         return result
 
@@ -1172,8 +1247,10 @@ class Client(Generic[ClientTransportT]):
         """
         logger.debug(f"[{self.name}] called complete: {ref}")
 
-        result = await self.session.complete(
-            ref=ref, argument=argument, context_arguments=context_arguments
+        result = await self._await_with_session_monitoring(
+            self.session.complete(
+                ref=ref, argument=argument, context_arguments=context_arguments
+            )
         )
         return result
 
@@ -1216,7 +1293,7 @@ class Client(Generic[ClientTransportT]):
         """
         logger.debug(f"[{self.name}] called list_tools")
 
-        result = await self.session.list_tools()
+        result = await self._await_with_session_monitoring(self.session.list_tools())
         return result
 
     async def list_tools(self) -> list[mcp.types.Tool]:
@@ -1282,19 +1359,23 @@ class Client(Generic[ClientTransportT]):
                     else None,  # SEP-1686: task as direct param (spec-compliant)
                 )
             )
-            result = await self.session.send_request(
-                request=request,  # type: ignore[arg-type]
-                result_type=mcp.types.CallToolResult,
-                request_read_timeout_seconds=timeout,  # type: ignore[arg-type]
-                progress_callback=progress_handler or self._progress_handler,
+            result = await self._await_with_session_monitoring(
+                self.session.send_request(
+                    request=request,  # type: ignore[arg-type]
+                    result_type=mcp.types.CallToolResult,
+                    request_read_timeout_seconds=timeout,  # type: ignore[arg-type]
+                    progress_callback=progress_handler or self._progress_handler,
+                )
             )
         else:
-            result = await self.session.call_tool(
-                name=name,
-                arguments=arguments,
-                read_timeout_seconds=timeout,  # ty: ignore[invalid-argument-type]
-                progress_callback=progress_handler or self._progress_handler,
-                meta=meta,
+            result = await self._await_with_session_monitoring(
+                self.session.call_tool(
+                    name=name,
+                    arguments=arguments,
+                    read_timeout_seconds=timeout,  # ty: ignore[invalid-argument-type]
+                    progress_callback=progress_handler or self._progress_handler,
+                    meta=meta,
+                )
             )
         return result
 
@@ -1510,9 +1591,11 @@ class Client(Generic[ClientTransportT]):
             RuntimeError: If client not connected
         """
         request = GetTaskRequest(params=GetTaskRequestParams(taskId=task_id))
-        return await self.session.send_request(
-            request=request,  # type: ignore[arg-type]
-            result_type=GetTaskResult,  # type: ignore[arg-type]
+        return await self._await_with_session_monitoring(
+            self.session.send_request(
+                request=request,  # type: ignore[arg-type]
+                result_type=GetTaskResult,  # type: ignore[arg-type]
+            )
         )
 
     async def get_task_result(self, task_id: str) -> Any:
@@ -1534,9 +1617,11 @@ class Client(Generic[ClientTransportT]):
             params=GetTaskPayloadRequestParams(taskId=task_id)
         )
         # Return raw result - Task classes handle type-specific parsing
-        result = await self.session.send_request(
-            request=request,  # type: ignore[arg-type]
-            result_type=GetTaskPayloadResult,  # type: ignore[arg-type]
+        result = await self._await_with_session_monitoring(
+            self.session.send_request(
+                request=request,  # type: ignore[arg-type]
+                result_type=GetTaskPayloadResult,  # type: ignore[arg-type]
+            )
         )
         # Return as dict for compatibility with Task class parsing
         return result.model_dump(exclude_none=True, by_alias=True)
@@ -1567,9 +1652,11 @@ class Client(Generic[ClientTransportT]):
         # Send protocol request
         params = PaginatedRequestParams(cursor=cursor, limit=limit)
         request = ListTasksRequest(params=params)
-        server_response = await self.session.send_request(
-            request=request,  # type: ignore[invalid-argument-type]
-            result_type=mcp.types.ListTasksResult,
+        server_response = await self._await_with_session_monitoring(
+            self.session.send_request(
+                request=request,  # type: ignore[invalid-argument-type]
+                result_type=mcp.types.ListTasksResult,
+            )
         )
 
         # If server returned tasks, use those
@@ -1604,9 +1691,11 @@ class Client(Generic[ClientTransportT]):
             RuntimeError: If task doesn't exist
         """
         request = CancelTaskRequest(params=CancelTaskRequestParams(taskId=task_id))
-        return await self.session.send_request(
-            request=request,  # type: ignore[invalid-argument-type]
-            result_type=mcp.types.CancelTaskResult,
+        return await self._await_with_session_monitoring(
+            self.session.send_request(
+                request=request,  # type: ignore[invalid-argument-type]
+                result_type=mcp.types.CancelTaskResult,
+            )
         )
 
     @classmethod
